@@ -181,7 +181,7 @@ func (c *Client) DownloadFile(ctx context.Context, f model.SlackFile, maxBytes i
 
 // UploadFile shares a file in a channel (or thread).
 func (c *Client) UploadFile(ctx context.Context, channel, threadTS string, a model.Attachment) error {
-	_, err := c.api.UploadFileV2Context(ctx, slack.UploadFileV2Parameters{
+	_, err := c.api.UploadFileContext(ctx, slack.UploadFileParameters{
 		Reader:          bytes.NewReader(a.Content),
 		FileSize:        len(a.Content),
 		Filename:        a.Filename,

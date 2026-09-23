@@ -88,6 +88,8 @@ Fill in `pairings`:
 
 ### 4. Authorize the Webex account (once)
 
+Building requires Go 1.27 or newer.
+
 ```sh
 make build
 ./bin/slack-webex-sync webex-login -config config.yaml
@@ -152,8 +154,15 @@ See [`config.example.yaml`](config.example.yaml) for every option. The main ones
 ## Development
 
 ```sh
-make test   # go test -race ./...
+make test        # go test -race ./...
 make vet
+make vulncheck   # govulncheck against the Go vulnerability database
+```
+
+Dependencies are kept on their latest releases. To update them:
+
+```sh
+go get -u ./... && go mod tidy && make test vulncheck
 ```
 
 The store tests also run against PostgreSQL when `SWS_TEST_POSTGRES_DSN` is set:
