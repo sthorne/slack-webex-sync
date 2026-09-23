@@ -50,6 +50,9 @@ func TestParse(t *testing.T) {
 	if !cfg.Sync.BotMessages || !cfg.Sync.Files || cfg.Sync.Reactions {
 		t.Errorf("sync settings: %+v", cfg.Sync)
 	}
+	if cfg.Storage.RetentionDays != 30 || cfg.Storage.Retention() != 30*24*time.Hour || cfg.Storage.PurgeInterval != time.Hour {
+		t.Errorf("storage defaults: %+v", cfg.Storage)
+	}
 	if cfg.Pairings[1].Name != "pairing-1" {
 		t.Errorf("unnamed pairing got %q", cfg.Pairings[1].Name)
 	}
@@ -59,11 +62,13 @@ func TestParseErrors(t *testing.T) {
 	t.Setenv("SWS_TEST_BOT", "xoxb-1")
 	t.Setenv("SWS_TEST_SECRET", "s")
 	tests := map[string]struct{ from, to, want string }{
-		"missing env":       {"${SWS_TEST_BOT}", "${SWS_TEST_UNSET_VAR}", "SWS_TEST_UNSET_VAR"},
-		"bad driver":        {"driver: sqlite", "driver: mysql", "storage.driver"},
-		"missing app token": {`app_token: "xapp-1"`, "", "app_token"},
-		"duplicate channel": {"slack_channel: C2", "slack_channel: C1", "more than one pairing"},
-		"duplicate room":    {"webex_room: R2", "webex_room: R1", "more than one pairing"},
+		"missing env":         {"${SWS_TEST_BOT}", "${SWS_TEST_UNSET_VAR}", "SWS_TEST_UNSET_VAR"},
+		"missing driver":      {"driver: sqlite", `driver: ""`, "storage.driver"},
+		"negative retention":  {"dsn: ${SWS_TEST_DB:-bridge.db}", "dsn: x\n  retention_days: -1", "retention_days"},
+		"zero purge interval": {"dsn: ${SWS_TEST_DB:-bridge.db}", "dsn: x\n  purge_interval: 0s", "purge_interval"},
+		"missing app token":   {`app_token: "xapp-1"`, "", "app_token"},
+		"duplicate channel":   {"slack_channel: C2", "slack_channel: C1", "more than one pairing"},
+		"duplicate room":      {"webex_room: R2", "webex_room: R1", "more than one pairing"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -83,7 +88,32 @@ func TestExampleConfigParses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Pairings) != 2 || cfg.Webex.PollInterval != 10*time.Second || !cfg.Webex.WebsocketEnabled() {
+	if len(cfg.Pairings) != 2 || cfg.Webex.PollInterval != 10*time.Second || !cfg.Webex.WebsocketEnabled() ||
+		cfg.Storage.RetentionDays != 30 || cfg.Storage.PurgeInterval != time.Hour {
 		t.Errorf("unexpected example config: %+v", cfg)
+	}
+}
+
+func TestRetentionOverride(t *testing.T) {
+	t.Setenv("SWS_TEST_BOT", "xoxb-1")
+	t.Setenv("SWS_TEST_SECRET", "s")
+	for days, want := range map[string]time.Duration{"0": 0, "60": 60 * 24 * time.Hour, "90": 90 * 24 * time.Hour} {
+		raw := strings.Replace(valid, "dsn: ${SWS_TEST_DB:-bridge.db}", "dsn: x\n  retention_days: "+days+"\n  purge_interval: 15m", 1)
+		cfg, err := Parse([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Storage.Retention() != want || cfg.Storage.PurgeInterval != 15*time.Minute {
+			t.Errorf("retention_days %s -> %v, interval %v", days, cfg.Storage.Retention(), cfg.Storage.PurgeInterval)
+		}
+	}
+}
+
+func TestMemoryDriverNeedsNoDSN(t *testing.T) {
+	t.Setenv("SWS_TEST_BOT", "xoxb-1")
+	t.Setenv("SWS_TEST_SECRET", "s")
+	raw := strings.Replace(valid, "driver: sqlite\n  dsn: ${SWS_TEST_DB:-bridge.db}", "driver: memory\n  dsn: \"\"", 1)
+	if _, err := Parse([]byte(raw)); err != nil {
+		t.Errorf("memory without dsn: %v", err)
 	}
 }

@@ -22,9 +22,22 @@ type Pairing struct {
 }
 
 type Storage struct {
-	// Driver is "sqlite" or "postgres".
+	// Driver names a registered store backend: sqlite, postgres, redis,
+	// dynamodb, mongodb or memory.
 	Driver string `yaml:"driver"`
-	DSN    string `yaml:"dsn"`
+	// DSN is the backend-specific connection string.
+	DSN string `yaml:"dsn"`
+	// RetentionDays is how long message links are kept; 0 keeps them
+	// forever. After that, edits, deletes, replies and reactions on the
+	// original message no longer sync.
+	RetentionDays int `yaml:"retention_days"`
+	// PurgeInterval is how often expired links are deleted.
+	PurgeInterval time.Duration `yaml:"purge_interval"`
+}
+
+// Retention is RetentionDays as a duration (0 means keep forever).
+func (s Storage) Retention() time.Duration {
+	return time.Duration(s.RetentionDays) * 24 * time.Hour
 }
 
 type Slack struct {
@@ -83,11 +96,19 @@ const (
 	DefaultPollInterval = 10 * time.Second
 	DefaultRedirectURI  = "http://localhost:8765/callback"
 	DefaultScopes       = "spark:all spark:kms"
+
+	DefaultRetentionDays = 30
+	DefaultPurgeInterval = time.Hour
 )
 
 func defaults() Config {
 	return Config{
-		Storage: Storage{Driver: "sqlite", DSN: "slack-webex-sync.db"},
+		Storage: Storage{
+			Driver:        "sqlite",
+			DSN:           "slack-webex-sync.db",
+			RetentionDays: DefaultRetentionDays,
+			PurgeInterval: DefaultPurgeInterval,
+		},
 		Webex: Webex{
 			DeviceURL:    DefaultDeviceURL,
 			PollInterval: DefaultPollInterval,
@@ -168,13 +189,19 @@ func Parse(raw []byte) (*Config, error) {
 
 func (c *Config) validate() error {
 	var errs []error
-	switch c.Storage.Driver {
-	case "sqlite", "postgres":
-	default:
-		errs = append(errs, fmt.Errorf("storage.driver must be sqlite or postgres, got %q", c.Storage.Driver))
+	// Whether the driver exists is checked by store.Open, which knows the
+	// registered backends.
+	if c.Storage.Driver == "" {
+		errs = append(errs, errors.New("storage.driver is required"))
 	}
-	if c.Storage.DSN == "" {
+	if c.Storage.DSN == "" && c.Storage.Driver != "memory" {
 		errs = append(errs, errors.New("storage.dsn is required"))
+	}
+	if c.Storage.RetentionDays < 0 {
+		errs = append(errs, errors.New("storage.retention_days must be 0 (keep forever) or more"))
+	}
+	if c.Storage.PurgeInterval <= 0 {
+		errs = append(errs, errors.New("storage.purge_interval must be positive"))
 	}
 	if c.Slack.BotToken == "" {
 		errs = append(errs, errors.New("slack.bot_token is required"))

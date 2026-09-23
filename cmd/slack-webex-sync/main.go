@@ -13,11 +13,13 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sthorne/slack-webex-sync/internal/bridge"
 	"github.com/sthorne/slack-webex-sync/internal/config"
 	"github.com/sthorne/slack-webex-sync/internal/slackapi"
 	"github.com/sthorne/slack-webex-sync/internal/store"
+	_ "github.com/sthorne/slack-webex-sync/internal/store/all" // register backends
 	"github.com/sthorne/slack-webex-sync/internal/webex"
 )
 
@@ -69,7 +71,10 @@ func main() {
 	if err != nil {
 		fatal("load config", err)
 	}
-	st, err := store.Open(ctx, cfg.Storage.Driver, cfg.Storage.DSN)
+	st, err := store.Open(ctx, cfg.Storage.Driver, store.Options{
+		DSN:       cfg.Storage.DSN,
+		Retention: cfg.Storage.Retention(),
+	})
 	if err != nil {
 		fatal("open storage", err)
 	}
@@ -156,8 +161,12 @@ func run(ctx context.Context, cfg *config.Config, st store.Store) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); b.Run(ctx) }()
+	go func() {
+		defer wg.Done()
+		store.RunPurger(ctx, st, cfg.Storage.Retention(), cfg.Storage.PurgeInterval, time.Now)
+	}()
 	go func() { defer wg.Done(); source.Run(ctx, b.SubmitWebex) }()
 	err := sl.Listen(ctx, b.SubmitSlack)
 	cancel() // if Slack stops, stop everything else too

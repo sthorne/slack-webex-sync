@@ -2,8 +2,23 @@
 # variable as ${NAME} or ${NAME:-default}.
 
 storage:
-  driver: sqlite                 # sqlite | postgres
-  dsn: slack-webex-sync.db       # postgres: postgres://user:pass@host:5432/db?sslmode=require
+  # Backend: sqlite | postgres | redis | dynamodb | mongodb | memory
+  driver: sqlite
+  # Connection string; the format depends on the backend:
+  #   sqlite:   slack-webex-sync.db
+  #   postgres: postgres://user:pass@host:5432/db?sslmode=require
+  #   redis:    redis://user:pass@host:6379/0?prefix=sws:     (rediss:// for TLS)
+  #   dynamodb: dynamodb://TABLE?region=us-east-1&create_table=true
+  #   mongodb:  mongodb://user:pass@host:27017/slack_webex_sync
+  #   memory:   (none; nothing survives a restart)
+  dsn: slack-webex-sync.db
+
+  # How long message links are kept, e.g. 30, 60 or 90. 0 keeps them forever.
+  # Once a link is gone, edits, deletes, replies and reactions on that
+  # message no longer sync.
+  retention_days: 30
+  # How often expired links are deleted.
+  purge_interval: 1h
 
 slack:
   bot_token: ${SLACK_BOT_TOKEN}  # xoxb-...

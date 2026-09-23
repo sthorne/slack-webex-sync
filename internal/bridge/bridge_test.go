@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/sthorne/slack-webex-sync/internal/config"
 	"github.com/sthorne/slack-webex-sync/internal/model"
 	"github.com/sthorne/slack-webex-sync/internal/store"
+	"github.com/sthorne/slack-webex-sync/internal/store/memstore"
 	"github.com/sthorne/slack-webex-sync/internal/webex"
 )
 
@@ -181,11 +181,7 @@ func newHarness(t *testing.T, mutate ...func(*config.Config)) *harness {
 		m(cfg)
 	}
 	ctx := context.Background()
-	st, err := store.Open(ctx, "sqlite", filepath.Join(t.TempDir(), "bridge.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st := memstore.New(store.Options{})
 	h := &harness{slack: newFakeSlack(), webex: newFakeWebex(), store: st, ctx: ctx}
 	h.b = New(cfg, st, h.slack, h.webex)
 	if err := h.b.Start(ctx); err != nil {

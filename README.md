@@ -31,7 +31,8 @@ and paired spaces are polled whenever the websocket is down.
                            ├─► event  ──────┤    the websocket is down)
   Slack  ◄──── Web API ────┤   queue        ├──── REST API ────►   Webex
                            │                │
-                           └── SQLite / PostgreSQL: message links ─┘
+                           └──── store: message links ─────────┘
+                     (SQLite · PostgreSQL · Redis · DynamoDB · MongoDB · memory)
 ```
 
 * Every mirrored message is stored as a **link** (Slack `ts` ↔ Webex message
@@ -45,6 +46,8 @@ and paired spaces are polled whenever the websocket is down.
 * Deleting an original deletes its copy. Deleting a *copy* (for example, a
   Slack admin removing a mirrored post) only unlinks it. The author's
   original stays.
+* Links expire after `storage.retention_days` (30 by default), so the store
+  stays small. After that, activity on the old message no longer syncs.
 
 ## Setup
 
@@ -114,7 +117,9 @@ See [`config.example.yaml`](config.example.yaml) for every option. The main ones
 
 | Key | Default | |
 |---|---|---|
-| `storage.driver` | `sqlite` | `sqlite` (single file, no cgo) or `postgres` |
+| `storage.driver` | `sqlite` | `sqlite`, `postgres`, `redis`, `dynamodb`, `mongodb` or `memory`. See [Storage](#storage). |
+| `storage.retention_days` | `30` | How long message links are kept (30, 60, 90, …). `0` keeps them forever. |
+| `storage.purge_interval` | `1h` | How often expired links are deleted |
 | `webex.websocket` | `true` | Use the real-time websocket. Set `false` to poll only. |
 | `webex.poll_interval` | `10s` | How often to poll while the websocket is down |
 | `sync.bot_messages` | `true` | Mirror posts from other bots and integrations |
@@ -123,6 +128,64 @@ See [`config.example.yaml`](config.example.yaml) for every option. The main ones
 | `sync.reactions` | `true` | Mirror reactions |
 | `display.slack_username_suffix` | `" (Webex)"` | Appended to Webex authors' names in Slack |
 | `display.webex_name_suffix` | `""` | Appended to Slack authors' names in Webex |
+
+## Storage
+
+The bridge stores only small bookkeeping records: which Slack message
+matches which Webex message, reaction bookkeeping, and the Webex OAuth tokens.
+Message content is never stored. Any backend below works; pick whichever
+your team already runs.
+
+| `driver` | `dsn` example | How old links expire |
+|---|---|---|
+| `sqlite` | `/var/lib/slack-webex-sync/links.db` | The purge job deletes them every `purge_interval` |
+| `postgres` | `postgres://user:pass@host:5432/db?sslmode=require` | The purge job |
+| `redis` | `redis://user:pass@host:6379/0?prefix=sws:` (`rediss://` for TLS) | Native key TTL, plus the purge job to clean up index entries |
+| `dynamodb` | `dynamodb://TABLE?region=us-east-1&create_table=true` | Native DynamoDB TTL on the `expires` attribute (enabled automatically) |
+| `mongodb` | `mongodb://user:pass@host:27017/slack_webex_sync` | Native TTL index on `created_at`, plus the purge job |
+| `memory` | (none) | The purge job. Nothing survives a restart; for trials and tests. |
+
+Backend notes:
+
+* **Redis:** standalone Redis or Sentinel. Redis Cluster isn't supported,
+  because the atomic scripts touch keys that can hash to different slots.
+* **DynamoDB:** credentials come from the standard AWS chain (environment,
+  shared config, or instance/task role). The role needs `GetItem`,
+  `PutItem`, `DeleteItem`, `Query`, `TransactWriteItems`, `DescribeTable`,
+  `DescribeTimeToLive` and `UpdateTimeToLive`, plus `CreateTable` if you use
+  `create_table=true`. DynamoDB deletes expired items lazily (usually within
+  a few days), so the bridge hides expired items itself in the meantime.
+  Expiry times are stamped when a record is written, so changing
+  `retention_days` only affects new records. Records written while retention
+  was `0` have no expiry stamp and are never deleted by DynamoDB, though the
+  bridge still hides them once they're past the retention.
+* **MongoDB:** the TTL index follows `retention_days` automatically: it is
+  created, updated in place, or dropped when you set 0. For
+  MongoDB-compatible servers without TTL indexes (FerretDB, for example), add
+  `ttl_index=false` to the DSN. The purge job then does all the expiring.
+
+### Adding another backend
+
+Backends register themselves by name, the way `database/sql` drivers do:
+
+1. Create a package under `internal/store/` that implements
+   [`store.Store`](internal/store/store.go). The doc comment on each method
+   is the contract: atomicity, not-found behavior, and what `Purge` must
+   guarantee.
+2. In its `init`, call `store.Register("name", Open)`, and add a blank import
+   to [`internal/store/all`](internal/store/all/all.go).
+3. Run the shared suite from the package's tests. It checks the whole
+   contract, including concurrency and purging:
+
+   ```go
+   func TestConformance(t *testing.T) {
+       storetest.Run(t, func(t *testing.T, opts store.Options) store.Store {
+           return openFreshStore(t, opts)
+       })
+   }
+   ```
+
+`storage.driver: name` then selects the new backend. Nothing else changes.
 
 ## Limitations and caveats
 
@@ -165,11 +228,21 @@ Dependencies are kept on their latest releases. To update them:
 go get -u ./... && go mod tidy && make test vulncheck
 ```
 
-The store tests also run against PostgreSQL when `SWS_TEST_POSTGRES_DSN` is set:
+Every store backend runs the same conformance suite (`internal/store/storetest`).
+SQLite, memory and Redis run by default; Redis runs in-process via miniredis.
+To run against real servers, point these at disposable instances (the
+tests wipe what they use):
 
 ```sh
-SWS_TEST_POSTGRES_DSN="postgres://postgres@localhost:5432/postgres?sslmode=disable" go test ./internal/store/
+SWS_TEST_POSTGRES_DSN="postgres://postgres@localhost:5432/postgres?sslmode=disable" \
+SWS_TEST_REDIS_URL="redis://localhost:6379/15" \
+SWS_TEST_DYNAMODB_ENDPOINT="http://localhost:8000" \
+SWS_TEST_MONGODB_URI="mongodb://localhost:27017" \
+go test ./internal/store/...
 ```
+
+The DynamoDB tests work with DynamoDB Local or `moto_server`. For a
+MongoDB-compatible server without TTL indexes, also set `SWS_TEST_MONGODB_TTL=false`.
 
 Layout:
 
@@ -179,6 +252,8 @@ internal/bridge/        sync engine (platform-neutral, tested with fakes)
 internal/format/        Slack mrkdwn <-> Webex markdown, mentions, emoji
 internal/slackapi/      slack-go adapter + Socket Mode listener
 internal/webex/         REST client, OAuth, device websocket, poller
-internal/store/         message links on SQLite / PostgreSQL
+internal/store/         Store contract, backend registry, purge scheduler
+internal/store/*store/  backends: sqlstore, redisstore, dynamostore, mongostore, memstore
+internal/store/storetest/  conformance suite every backend must pass
 internal/config/        YAML config with ${ENV} expansion
 ```
