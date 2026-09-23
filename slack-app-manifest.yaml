@@ -1,0 +1,35 @@
+# Create the Slack app from this manifest: https://api.slack.com/apps -> Create New App -> From a manifest
+display_information:
+  name: Webex Bridge
+  description: Mirrors paired channels to and from Webex spaces.
+features:
+  bot_user:
+    display_name: Webex Bridge
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - channels:history     # read messages in public channels
+      - groups:history       # read messages in private channels
+      - channels:read        # "check" command: channel names and membership
+      - groups:read
+      - chat:write           # post mirrored messages
+      - chat:write.customize # show the Webex author's name and avatar
+      - users:read           # author names and avatars
+      - users:read.email     # match people across platforms for @mentions
+      - files:read           # download files to copy them to Webex
+      - files:write          # upload files copied from Webex
+      - reactions:read       # see reactions to post notes in Webex
+      - reactions:write      # mirror Webex reactions
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - reaction_added
+      - reaction_removed
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

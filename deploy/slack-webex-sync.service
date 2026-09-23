@@ -1,0 +1,21 @@
+[Unit]
+Description=Slack <-> Webex channel sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=slack-webex-sync
+WorkingDirectory=/var/lib/slack-webex-sync
+EnvironmentFile=/etc/slack-webex-sync/env
+ExecStart=/usr/local/bin/slack-webex-sync run -config /etc/slack-webex-sync/config.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/slack-webex-sync
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

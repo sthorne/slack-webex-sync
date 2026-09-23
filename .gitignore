@@ -1,0 +1,7 @@
+/slack-webex-sync
+/bin/
+*.db
+*.db-shm
+*.db-wal
+config.yaml
+.env

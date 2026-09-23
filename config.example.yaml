@@ -1,0 +1,44 @@
+# Copy to config.yaml and fill in. Any value can reference an environment
+# variable as ${NAME} or ${NAME:-default}.
+
+storage:
+  driver: sqlite                 # sqlite | postgres
+  dsn: slack-webex-sync.db       # postgres: postgres://user:pass@host:5432/db?sslmode=require
+
+slack:
+  bot_token: ${SLACK_BOT_TOKEN}  # xoxb-...
+  app_token: ${SLACK_APP_TOKEN}  # xapp-... with connections:write (Socket Mode)
+
+webex:
+  # OAuth integration used by the service account. Run
+  # `slack-webex-sync webex-login` once to authorize; tokens are then kept in
+  # storage and refreshed automatically.
+  client_id: ${WEBEX_CLIENT_ID}
+  client_secret: ${WEBEX_CLIENT_SECRET}
+  # refresh_token: ${WEBEX_REFRESH_TOKEN}   # optional alternative to webex-login
+  # redirect_uri: http://localhost:8765/callback
+  # scopes: "spark:all spark:kms"
+
+  websocket: true        # real-time events; set false to only poll
+  poll_interval: 10s     # used while the websocket is down (or disabled)
+  # device_url: https://wdm-a.wbx2.com/wdm/api/v1/devices
+
+display:
+  slack_username_suffix: " (Webex)"   # "Carol (Webex)" in Slack
+  webex_name_suffix: ""               # e.g. " (Slack)" -> "**Ada (Slack)**: ..." in Webex
+
+sync:
+  bot_messages: true        # mirror posts from other bots/integrations
+  files: true
+  max_file_bytes: 52428800  # 50 MiB
+  mentions: true            # turn @mentions into real mentions when emails match
+  reactions: true
+
+# Each Slack channel and each Webex space may appear in only one pairing.
+pairings:
+  - name: engineering
+    slack_channel: C0123456789         # channel ID (channel details -> bottom of "About")
+    webex_room: Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAw
+  - name: support
+    slack_channel: C0987654321
+    webex_room: Y2lzY29zcGFyazovL3VzL1JPT00vMTExMTExMTEtMTExMS0xMTExLTExMTEtMTExMTExMTExMTEx
