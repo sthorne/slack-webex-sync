@@ -27,19 +27,21 @@ and paired spaces are polled whenever the websocket is down.
 ```
              Socket Mode                          device websocket
   Slack  ─────────────────►┐                ┌◄───────────────────  Webex
-                           │   ordered      │   (REST polling while
+                           │    durable     │   (REST polling while
                            ├─► event  ──────┤    the websocket is down)
-  Slack  ◄──── Web API ────┤   queue        ├──── REST API ────►   Webex
+  Slack  ◄──── Web API ────┤    queue       ├──── REST API ────►   Webex
                            │                │
-                           └──── store: message links ─────────┘
+                           └── store: queue + message links ───┘
                      (SQLite · PostgreSQL · Redis · DynamoDB · MongoDB · memory)
 ```
 
 * Every mirrored message is stored as a **link** (Slack `ts` ↔ Webex message
   id). Links are how edits, deletes, thread replies and reactions find their
   counterpart.
-* Events from both platforms go through **one queue** and are handled in
-  order, so a reply is never processed before the message it replies to.
+* Every incoming event is **saved to the store before it is acknowledged**,
+  then processed oldest first. A crash or a failed API call doesn't lose it:
+  failures are retried, and events that keep failing are parked for an
+  operator (see [Running in production](#running-in-production)).
 * **Loop prevention:** anything posted by the bridge's own identities (the
   Slack bot and the Webex service account) is ignored. A message that already
   has a link is never mirrored twice, which also makes redeliveries harmless.
@@ -111,6 +113,64 @@ saved in the configured storage and refreshed automatically after that.
 To run it as a service, see [`deploy/slack-webex-sync.service`](deploy/slack-webex-sync.service)
 (a systemd unit that reads secrets from `/etc/slack-webex-sync/env`).
 
+Before relying on it, work through the [live smoke test](docs/SMOKE_TEST.md).
+
+## Running in production
+
+### Retries and parked events
+
+Failed events are retried after 1, 2, 4 and 8 minutes: 5 attempts over about
+15 minutes. After that they are **parked**, which means kept but no longer
+retried, and logged as `event parked`. Other events keep flowing while one
+is backing off.
+
+```sh
+slack-webex-sync events list          # parked events, with the last error
+slack-webex-sync events retry ID      # put one back in the queue
+slack-webex-sync events retry -all    # ...or all of them
+slack-webex-sync events drop ID       # give up on one
+```
+
+A running bridge picks up retried events within a few seconds.
+
+### Encrypting stored tokens
+
+The Webex OAuth tokens live in the store. To encrypt them (AES-256-GCM),
+generate a key and set `storage.encryption_key`, normally from an environment variable:
+
+```sh
+slack-webex-sync generate-key          # prints a base64 key; keep it in your secret manager
+export SWS_ENCRYPTION_KEY=...          # config: encryption_key: ${SWS_ENCRYPTION_KEY}
+```
+
+Tokens already stored in plain text are encrypted on the next start. Without
+a key the bridge still runs but logs a warning. If you lose the key, run
+`webex-login` again.
+
+### Health and metrics
+
+By default the bridge serves these on `127.0.0.1:9090` (`health.listen`; set
+it to `""` to turn them off):
+
+* `GET /healthz`: `200` when Slack is connected, Webex events are arriving
+  (via the websocket or polling), and the store answers. Otherwise `503`.
+  The JSON body shows each check.
+* `GET /metrics`: Prometheus format.
+
+| Metric | |
+|---|---|
+| `sws_events_received_total{source}` | Events queued, by source platform |
+| `sws_events_synced_total{source}` | Events processed successfully |
+| `sws_event_failures_total{source}` | Failed attempts (each is retried or parked) |
+| `sws_events_parked_total{source}` | Events that were parked |
+| `sws_queue_events{status}` | Current `pending` and `parked` counts |
+| `sws_connected{platform}` | 1 when events are arriving from `slack` / `webex` |
+| `sws_webex_websocket_up` | 1 on the real-time websocket, 0 when polling |
+
+Good alerts: `sws_queue_events{status="parked"} > 0`, `sws_connected == 0`
+for more than 5 minutes, and `sws_webex_websocket_up == 0` for more than an
+hour (polling works, but deletes and reactions from Webex won't sync).
+
 ## Configuration
 
 See [`config.example.yaml`](config.example.yaml) for every option. The main ones:
@@ -120,6 +180,8 @@ See [`config.example.yaml`](config.example.yaml) for every option. The main ones
 | `storage.driver` | `sqlite` | `sqlite`, `postgres`, `redis`, `dynamodb`, `mongodb` or `memory`. See [Storage](#storage). |
 | `storage.retention_days` | `30` | How long message links are kept (30, 60, 90, …). `0` keeps them forever. |
 | `storage.purge_interval` | `1h` | How often expired links are deleted |
+| `storage.encryption_key` | none | Encrypts stored Webex tokens. See [Encrypting stored tokens](#encrypting-stored-tokens). |
+| `health.listen` | `127.0.0.1:9090` | Address for `/healthz` and `/metrics`; `""` disables them |
 | `webex.websocket` | `true` | Use the real-time websocket. Set `false` to poll only. |
 | `webex.poll_interval` | `10s` | How often to poll while the websocket is down |
 | `sync.bot_messages` | `true` | Mirror posts from other bots and integrations |
@@ -131,9 +193,12 @@ See [`config.example.yaml`](config.example.yaml) for every option. The main ones
 
 ## Storage
 
-The bridge stores only small bookkeeping records: which Slack message
-matches which Webex message, reaction bookkeeping, and the Webex OAuth tokens.
-Message content is never stored. Any backend below works; pick whichever
+The bridge stores small records: which Slack message matches which Webex
+message, reaction bookkeeping, the Webex OAuth tokens, and the event queue.
+Queued events contain message text (plus ids and file links, not file
+contents). An event is deleted as soon as it syncs, but **parked events keep
+their text** until they are retried or dropped. Treat the store as holding
+message content. Any backend below works; pick whichever
 your team already runs.
 
 | `driver` | `dsn` example | How old links expire |
@@ -209,6 +274,13 @@ Backends register themselves by name, the way `database/sql` drivers do:
 * **History is not backfilled.** Only messages posted while the bridge is
   running are mirrored, plus anything the catch-up poll finds after a
   websocket reconnect (the last 100 messages per space).
+* **Slack messages posted while the bridge is down for more than a few
+  minutes are missed.** Slack retries delivery only briefly, and the bridge
+  has no Slack catch-up yet. Webex messages are caught up on restart.
+* **One instance at a time.** Don't run two bridges against the same
+  channels or the same store.
+* **A retried event can occasionally post twice.** This happens if a post
+  succeeded but saving its link failed.
 * The Webex service account's own messages are never mirrored, so don't use
   it as a personal account.
 * Webex messages are limited to about 7 KB. Longer Slack messages are
@@ -221,6 +293,12 @@ make test        # go test -race ./...
 make vet
 make vulncheck   # govulncheck against the Go vulnerability database
 ```
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs gofmt, vet,
+`go mod tidy`, govulncheck, a build, and the race-detector tests. The store
+tests run against real PostgreSQL, Redis and MongoDB service containers and
+the moto DynamoDB emulator, and CI fails if any backend test is skipped.
+Actions are pinned to commit SHAs.
 
 Dependencies are kept on their latest releases. To update them:
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sthorne/slack-webex-sync/internal/config"
 	"github.com/sthorne/slack-webex-sync/internal/model"
@@ -101,6 +102,8 @@ type fakeWebex struct {
 	files    map[string]model.Attachment
 	// rejectMentions makes posts containing a Webex mention fail with 400.
 	rejectMentions bool
+	// failPosts makes the next n posts fail with a 503.
+	failPosts int
 }
 
 func newFakeWebex() *fakeWebex {
@@ -132,6 +135,10 @@ func (f *fakeWebex) GetMessage(_ context.Context, id string) (model.WebexMessage
 	return m, nil
 }
 func (f *fakeWebex) PostMessage(_ context.Context, room, markdown, parentID string, file *model.Attachment) (string, error) {
+	if f.failPosts > 0 {
+		f.failPosts--
+		return "", &webex.APIError{Status: http.StatusServiceUnavailable, Body: "try later"}
+	}
 	if f.rejectMentions && strings.Contains(markdown, "<@") {
 		return "", &webex.APIError{Status: http.StatusBadRequest, Body: "bad mention"}
 	}
@@ -500,19 +507,146 @@ func TestReactionsCanBeDisabled(t *testing.T) {
 	}
 }
 
-func TestQueueProcessesInOrder(t *testing.T) {
+// ---- durable queue -----------------------------------------------------------
+
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+func (h *harness) useClock() *fakeClock {
+	c := &fakeClock{t: time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)}
+	h.b.now = c.now
+	return c
+}
+
+func (h *harness) drain() {
+	for h.b.ProcessDue(h.ctx) > 0 {
+	}
+}
+
+func slackMessage(ts, threadTS, text string) model.SlackEvent {
+	return model.SlackEvent{Kind: model.SlackMessagePosted, Channel: "C1",
+		Message: model.SlackMessage{Channel: "C1", TS: ts, ThreadTS: threadTS, User: "U1", Text: text}}
+}
+
+func TestQueuedEventsProcessInOrder(t *testing.T) {
+	h := newHarness(t)
+	h.useClock()
+	if err := h.b.SubmitSlack(slackMessage("1.0", "", "root")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.b.SubmitSlack(slackMessage("1.1", "1.0", "reply")); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.webex.posts) != 0 {
+		t.Fatal("events were processed before the worker ran")
+	}
+	h.drain()
+	if len(h.webex.posts) != 2 || h.webex.posts[1].ParentID != "WX1" {
+		t.Errorf("posts = %+v", h.webex.posts)
+	}
+	if pending, parked, _ := h.store.CountEvents(h.ctx); pending != 0 || parked != 0 {
+		t.Errorf("queue not empty: %d pending, %d parked", pending, parked)
+	}
+}
+
+func TestFailedEventsRetryWithBackoffThenPark(t *testing.T) {
+	h := newHarness(t)
+	clock := h.useClock()
+	var outcomes []string
+	h.b.Observer = Observer{
+		Failed: func(s string) { outcomes = append(outcomes, "failed:"+s) },
+		Parked: func(s string) { outcomes = append(outcomes, "parked:"+s) },
+		Synced: func(s string) { outcomes = append(outcomes, "synced:"+s) },
+	}
+	h.webex.failPosts = 100
+	if err := h.b.SubmitSlack(slackMessage("1.0", "", "hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	h.drain() // attempt 1 fails
+	for i, delay := range RetryDelays {
+		clock.advance(delay - time.Second)
+		if h.b.ProcessDue(h.ctx) != 0 {
+			t.Fatalf("retry %d ran before its %v backoff", i+1, delay)
+		}
+		clock.advance(time.Second)
+		if h.b.ProcessDue(h.ctx) != 1 {
+			t.Fatalf("retry %d did not run after %v", i+1, delay)
+		}
+	}
+	pending, parked, _ := h.store.CountEvents(h.ctx)
+	if pending != 0 || parked != 1 {
+		t.Fatalf("after %d attempts: %d pending, %d parked", MaxAttempts, pending, parked)
+	}
+	list, _ := h.store.ParkedEvents(h.ctx, 10)
+	if list[0].Attempts != MaxAttempts || !strings.Contains(list[0].LastError, "503") {
+		t.Errorf("parked event = %+v", list[0])
+	}
+	if got := Describe(list[0]); got != "slack message channel=C1 ts=1.0" {
+		t.Errorf("Describe = %q", got)
+	}
+	if n := strings.Count(strings.Join(outcomes, ","), "failed:slack"); n != MaxAttempts || outcomes[len(outcomes)-1] != "parked:slack" {
+		t.Errorf("outcomes = %v", outcomes)
+	}
+
+	// An operator requeues it once Webex has recovered.
+	h.webex.failPosts = 0
+	if ok, err := Requeue(h.ctx, h.store, list[0].ID, clock.now()); !ok || err != nil {
+		t.Fatalf("Requeue = %v, %v", ok, err)
+	}
+	h.drain()
+	if len(h.webex.posts) != 1 || outcomes[len(outcomes)-1] != "synced:slack" {
+		t.Errorf("after requeue: posts=%+v outcomes=%v", h.webex.posts, outcomes)
+	}
+}
+
+func TestBackedOffEventDoesNotBlockOthers(t *testing.T) {
+	h := newHarness(t)
+	h.useClock()
+	h.webex.failPosts = 1
+	_ = h.b.SubmitSlack(slackMessage("1.0", "", "first"))
+	_ = h.b.SubmitSlack(slackMessage("2.0", "", "second"))
+	h.drain()
+	if len(h.webex.posts) != 1 || !strings.Contains(h.webex.posts[0].Markdown, "second") {
+		t.Errorf("posts = %+v", h.webex.posts)
+	}
+}
+
+func TestPendingEventsSurviveRestart(t *testing.T) {
+	h := newHarness(t)
+	h.useClock()
+	_ = h.b.SubmitSlack(slackMessage("1.0", "", "sent before a crash"))
+
+	// A new bridge on the same store picks the event up.
+	restarted := New(h.b.cfg, h.store, h.slack, h.webex)
+	if err := restarted.Start(h.ctx); err != nil {
+		t.Fatal(err)
+	}
+	for restarted.ProcessDue(h.ctx) > 0 {
+	}
+	if len(h.webex.posts) != 1 {
+		t.Errorf("event lost across restart: %+v", h.webex.posts)
+	}
+}
+
+func TestRunWakesOnSubmit(t *testing.T) {
 	h := newHarness(t)
 	ctx, cancel := context.WithCancel(h.ctx)
 	done := make(chan struct{})
 	go func() { h.b.Run(ctx); close(done) }()
-	h.b.SubmitSlack(model.SlackEvent{Kind: model.SlackMessagePosted, Channel: "C1", Message: model.SlackMessage{Channel: "C1", TS: "1.0", User: "U1", Text: "root"}})
-	h.b.SubmitSlack(model.SlackEvent{Kind: model.SlackMessagePosted, Channel: "C1", Message: model.SlackMessage{Channel: "C1", TS: "1.1", ThreadTS: "1.0", User: "U1", Text: "reply"}})
-	flushed := make(chan struct{})
-	h.b.queue <- func(context.Context) { close(flushed) }
-	<-flushed
+	_ = h.b.SubmitSlack(slackMessage("1.0", "", "hi"))
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if pending, _, _ := h.store.CountEvents(h.ctx); pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not process the event")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 	<-done
-	if len(h.webex.posts) != 2 || h.webex.posts[1].ParentID != "WX1" {
-		t.Errorf("posts = %+v", h.webex.posts)
-	}
 }

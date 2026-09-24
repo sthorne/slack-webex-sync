@@ -19,6 +19,9 @@ storage:
   retention_days: 30
   # How often expired links are deleted.
   purge_interval: 1h
+  # Optional: encrypts the stored Webex tokens. Create one with
+  # `slack-webex-sync generate-key` and keep it in your secret manager.
+  # encryption_key: ${SWS_ENCRYPTION_KEY}
 
 slack:
   bot_token: ${SLACK_BOT_TOKEN}  # xoxb-...
@@ -48,6 +51,10 @@ sync:
   max_file_bytes: 52428800  # 50 MiB
   mentions: true            # turn @mentions into real mentions when emails match
   reactions: true
+
+health:
+  # /healthz and Prometheus /metrics; "" turns them off.
+  listen: 127.0.0.1:9090
 
 # Each Slack channel and each Webex space may appear in only one pairing.
 pairings:

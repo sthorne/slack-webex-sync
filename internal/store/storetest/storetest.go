@@ -69,6 +69,9 @@ func Run(t *testing.T, open Opener) {
 		{"WebexReactionsConcurrent", testWebexReactionsConcurrent},
 		{"Values", testValues},
 		{"Purge", testPurge},
+		{"EventQueueOrder", testEventQueueOrder},
+		{"EventQueueRetryAndPark", testEventQueueRetryAndPark},
+		{"EventQueueSurvivesPurge", testEventQueueSurvivesPurge},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -322,5 +325,124 @@ func testPurge(t *testing.T, s store.Store, clock *Clock) {
 	}
 	if v, _ := s.GetValue(ctx(), "token"); v != "keep" {
 		t.Errorf("values must never be purged, got %q", v)
+	}
+}
+
+func event(id string, enqueued time.Time, payload string) store.QueuedEvent {
+	return store.QueuedEvent{
+		ID: id, Payload: []byte(payload), Status: store.EventPending,
+		Enqueued: enqueued, NextAttempt: enqueued,
+	}
+}
+
+func ids(events []store.QueuedEvent) []string {
+	out := make([]string, len(events))
+	for i, e := range events {
+		out[i] = e.ID
+	}
+	return out
+}
+
+func testEventQueueOrder(t *testing.T, s store.Store, clock *Clock) {
+	t0 := clock.Now()
+	// Enqueued out of order; b and c share a timestamp (ties go by ID).
+	must(t, s.EnqueueEvent(ctx(), event("c", t0.Add(time.Second), `{"n":3}`)))
+	must(t, s.EnqueueEvent(ctx(), event("a", t0, `{"n":1}`)))
+	must(t, s.EnqueueEvent(ctx(), event("b", t0.Add(time.Second), `{"n":2}`)))
+	// Re-enqueueing an existing ID changes nothing.
+	must(t, s.EnqueueEvent(ctx(), event("a", t0.Add(time.Hour), `{"n":99}`)))
+
+	due, err := s.DueEvents(ctx(), t0.Add(time.Minute), 10)
+	must(t, err)
+	if got := fmt.Sprint(ids(due)); got != "[a b c]" {
+		t.Fatalf("due order = %s, want [a b c]", got)
+	}
+	if string(due[0].Payload) != `{"n":1}` || due[0].Status != store.EventPending || !due[0].Enqueued.Equal(t0) {
+		t.Fatalf("event a = %+v", due[0])
+	}
+	if limited, _ := s.DueEvents(ctx(), t0.Add(time.Minute), 2); fmt.Sprint(ids(limited)) != "[a b]" {
+		t.Fatalf("limit 2 = %v", ids(limited))
+	}
+	if early, _ := s.DueEvents(ctx(), t0.Add(500*time.Millisecond), 10); fmt.Sprint(ids(early)) != "[a]" {
+		t.Fatalf("events not yet due were returned: %v", ids(early))
+	}
+
+	must(t, s.DeleteEvent(ctx(), "a"))
+	must(t, s.DeleteEvent(ctx(), "a")) // deleting twice is fine
+	got, err := s.GetEvent(ctx(), "a")
+	absent(t, "deleted event", got, err)
+	pending, parked, err := s.CountEvents(ctx())
+	must(t, err)
+	if pending != 2 || parked != 0 {
+		t.Fatalf("counts = %d pending, %d parked", pending, parked)
+	}
+}
+
+func testEventQueueRetryAndPark(t *testing.T, s store.Store, clock *Clock) {
+	t0 := clock.Now()
+	must(t, s.EnqueueEvent(ctx(), event("e1", t0, "x")))
+	must(t, s.EnqueueEvent(ctx(), event("e2", t0.Add(time.Second), "y")))
+
+	// A failed attempt pushes the event into the future.
+	retry := event("e1", t0, "x")
+	retry.Attempts = 1
+	retry.NextAttempt = t0.Add(time.Minute)
+	retry.LastError = "boom"
+	must(t, s.UpdateEvent(ctx(), retry))
+	if due, _ := s.DueEvents(ctx(), t0.Add(2*time.Second), 10); fmt.Sprint(ids(due)) != "[e2]" {
+		t.Fatalf("backed-off event returned early: %v", ids(due))
+	}
+	if due, _ := s.DueEvents(ctx(), t0.Add(time.Minute), 10); fmt.Sprint(ids(due)) != "[e1 e2]" {
+		t.Fatalf("after backoff = %v", ids(due))
+	}
+	got, err := s.GetEvent(ctx(), "e1")
+	must(t, err)
+	if got == nil || got.Attempts != 1 || got.LastError != "boom" || !got.NextAttempt.Equal(t0.Add(time.Minute)) || string(got.Payload) != "x" {
+		t.Fatalf("GetEvent = %+v", got)
+	}
+
+	// Parked events leave the due list and show up as parked.
+	parked := *got
+	parked.Status = store.EventParked
+	parked.Attempts = 5
+	must(t, s.UpdateEvent(ctx(), parked))
+	if due, _ := s.DueEvents(ctx(), t0.Add(time.Hour), 10); fmt.Sprint(ids(due)) != "[e2]" {
+		t.Fatalf("parked event still due: %v", ids(due))
+	}
+	list, err := s.ParkedEvents(ctx(), 10)
+	must(t, err)
+	if len(list) != 1 || list[0].ID != "e1" || list[0].Attempts != 5 || list[0].Status != store.EventParked {
+		t.Fatalf("ParkedEvents = %+v", list)
+	}
+	pending, parkedCount, err := s.CountEvents(ctx())
+	must(t, err)
+	if pending != 1 || parkedCount != 1 {
+		t.Fatalf("counts = %d pending, %d parked", pending, parkedCount)
+	}
+
+	// An operator retry puts it back in line.
+	requeued := list[0]
+	requeued.Status = store.EventPending
+	requeued.Attempts = 0
+	requeued.NextAttempt = t0.Add(time.Hour)
+	must(t, s.UpdateEvent(ctx(), requeued))
+	if due, _ := s.DueEvents(ctx(), t0.Add(time.Hour), 10); fmt.Sprint(ids(due)) != "[e1 e2]" {
+		t.Fatalf("requeued = %v", ids(due))
+	}
+	if list, _ := s.ParkedEvents(ctx(), 10); len(list) != 0 {
+		t.Fatalf("still parked: %v", ids(list))
+	}
+	must(t, s.UpdateEvent(ctx(), event("missing", t0, ""))) // not an error
+}
+
+func testEventQueueSurvivesPurge(t *testing.T, s store.Store, clock *Clock) {
+	t0 := clock.Now()
+	must(t, s.EnqueueEvent(ctx(), event("old", t0, "x")))
+	clock.Advance(Retention * 3)
+	if _, err := s.Purge(ctx(), clock.Now().Add(-Retention)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.GetEvent(ctx(), "old"); err != nil || got == nil {
+		t.Fatalf("queued event was purged: %v, %v", got, err)
 	}
 }

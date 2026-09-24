@@ -34,7 +34,7 @@ func TestPostgres(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, table := range []string{"message_links", "reaction_notes", "webex_reactions", "kv"} {
+		for _, table := range []string{"message_links", "reaction_notes", "webex_reactions", "events", "kv"} {
 			if _, err := s.(*Store).DB().Exec("DELETE FROM " + table); err != nil {
 				t.Fatal(err)
 			}

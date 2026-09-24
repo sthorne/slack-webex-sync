@@ -399,3 +399,131 @@ func (s *Store) pruneReactionSets(ctx context.Context) error {
 	}
 	return iter.Err()
 }
+
+// ---------------------------------------------------------------------------
+// Event queue
+//
+//	ev:{id}                  hash  the event
+//	evq:pending, evq:parked  zsets event ids scored by enqueue time
+//
+// Queued events have no TTL and are never purged.
+
+// KEYS: ev, evq:pending   ARGV: id, payload, status, enqueued, attempts, next, last_error
+var enqueueScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'payload', ARGV[2], 'status', ARGV[3], 'enqueued', ARGV[4],
+  'attempts', ARGV[5], 'next', ARGV[6], 'last_error', ARGV[7])
+redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
+return 1
+`)
+
+func (s *Store) EnqueueEvent(ctx context.Context, e store.QueuedEvent) error {
+	return enqueueScript.Run(ctx, s.rdb, []string{s.key("ev", e.ID), s.key("evq", string(store.EventPending))},
+		e.ID, e.Payload, string(e.Status), e.Enqueued.UnixMicro(), e.Attempts, e.NextAttempt.UnixMicro(), e.LastError,
+	).Err()
+}
+
+func (s *Store) readEvent(id string, f map[string]string) store.QueuedEvent {
+	enqueued, _ := strconv.ParseInt(f["enqueued"], 10, 64)
+	next, _ := strconv.ParseInt(f["next"], 10, 64)
+	attempts, _ := strconv.Atoi(f["attempts"])
+	return store.QueuedEvent{
+		ID: id, Payload: []byte(f["payload"]), Status: store.EventStatus(f["status"]),
+		Enqueued: time.UnixMicro(enqueued), Attempts: attempts, NextAttempt: time.UnixMicro(next), LastError: f["last_error"],
+	}
+}
+
+// eventsIn reads events from a status index in order, keeping those that
+// match, until limit are found or the index is exhausted.
+func (s *Store) eventsIn(ctx context.Context, status store.EventStatus, limit int, match func(store.QueuedEvent) bool) ([]store.QueuedEvent, error) {
+	const batch = 200
+	var out []store.QueuedEvent
+	for start := int64(0); len(out) < limit; start += batch {
+		ids, err := s.rdb.ZRange(ctx, s.key("evq", string(status)), start, start+batch-1).Result()
+		if err != nil {
+			return nil, err
+		}
+		pipe := s.rdb.Pipeline()
+		cmds := make([]*redis.MapStringStringCmd, len(ids))
+		for i, id := range ids {
+			cmds[i] = pipe.HGetAll(ctx, s.key("ev", id))
+		}
+		if len(ids) > 0 {
+			if _, err := pipe.Exec(ctx); err != nil {
+				return nil, err
+			}
+		}
+		for i, id := range ids {
+			f := cmds[i].Val()
+			if len(f) == 0 {
+				continue
+			}
+			if e := s.readEvent(id, f); match(e) && len(out) < limit {
+				out = append(out, e)
+			}
+		}
+		if len(ids) < batch {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) DueEvents(ctx context.Context, now time.Time, limit int) ([]store.QueuedEvent, error) {
+	return s.eventsIn(ctx, store.EventPending, limit, func(e store.QueuedEvent) bool {
+		return !e.NextAttempt.After(now)
+	})
+}
+
+func (s *Store) ParkedEvents(ctx context.Context, limit int) ([]store.QueuedEvent, error) {
+	return s.eventsIn(ctx, store.EventParked, limit, func(store.QueuedEvent) bool { return true })
+}
+
+// KEYS: ev   ARGV: id, status, attempts, next, last_error, index prefix
+var updateEventScript = redis.NewScript(`
+local f = redis.call('HMGET', KEYS[1], 'status', 'enqueued')
+if not f[1] then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'status', ARGV[2], 'attempts', ARGV[3], 'next', ARGV[4], 'last_error', ARGV[5])
+if f[1] ~= ARGV[2] then
+  redis.call('ZREM', ARGV[6] .. f[1], ARGV[1])
+  redis.call('ZADD', ARGV[6] .. ARGV[2], f[2], ARGV[1])
+end
+return 1
+`)
+
+func (s *Store) UpdateEvent(ctx context.Context, e store.QueuedEvent) error {
+	return updateEventScript.Run(ctx, s.rdb, []string{s.key("ev", e.ID)},
+		e.ID, string(e.Status), e.Attempts, e.NextAttempt.UnixMicro(), e.LastError, s.key("evq", ""),
+	).Err()
+}
+
+func (s *Store) DeleteEvent(ctx context.Context, id string) error {
+	pipe := s.rdb.TxPipeline()
+	pipe.Del(ctx, s.key("ev", id))
+	pipe.ZRem(ctx, s.key("evq", string(store.EventPending)), id)
+	pipe.ZRem(ctx, s.key("evq", string(store.EventParked)), id)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (s *Store) GetEvent(ctx context.Context, id string) (*store.QueuedEvent, error) {
+	f, err := s.rdb.HGetAll(ctx, s.key("ev", id)).Result()
+	if err != nil || len(f) == 0 {
+		return nil, err
+	}
+	e := s.readEvent(id, f)
+	return &e, nil
+}
+
+func (s *Store) CountEvents(ctx context.Context) (pending, parked int, err error) {
+	p, err := s.rdb.ZCard(ctx, s.key("evq", string(store.EventPending))).Result()
+	if err != nil {
+		return 0, 0, err
+	}
+	k, err := s.rdb.ZCard(ctx, s.key("evq", string(store.EventParked))).Result()
+	return int(p), int(k), err
+}

@@ -33,6 +33,14 @@ type Storage struct {
 	RetentionDays int `yaml:"retention_days"`
 	// PurgeInterval is how often expired links are deleted.
 	PurgeInterval time.Duration `yaml:"purge_interval"`
+	// EncryptionKey (base64, 32 bytes) encrypts the Webex OAuth tokens in
+	// storage. Optional; without it tokens are stored in plain text.
+	EncryptionKey string `yaml:"encryption_key"`
+}
+
+type Health struct {
+	// Listen is the address for /healthz and /metrics; empty disables them.
+	Listen string `yaml:"listen"`
 }
 
 // Retention is RetentionDays as a duration (0 means keep forever).
@@ -88,6 +96,7 @@ type Config struct {
 	Webex    Webex     `yaml:"webex"`
 	Display  Display   `yaml:"display"`
 	Sync     Sync      `yaml:"sync"`
+	Health   Health    `yaml:"health"`
 	Pairings []Pairing `yaml:"pairings"`
 }
 
@@ -99,6 +108,7 @@ const (
 
 	DefaultRetentionDays = 30
 	DefaultPurgeInterval = time.Hour
+	DefaultHealthListen  = "127.0.0.1:9090"
 )
 
 func defaults() Config {
@@ -116,6 +126,7 @@ func defaults() Config {
 			Scopes:       DefaultScopes,
 		},
 		Display: Display{SlackUsernameSuffix: " (Webex)"},
+		Health:  Health{Listen: DefaultHealthListen},
 		Sync: Sync{
 			BotMessages:  true,
 			Files:        true,

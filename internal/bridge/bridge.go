@@ -7,9 +7,9 @@
 // identities (the Slack bot and the Webex service account) are ignored. A
 // message that already has a link is never mirrored again.
 //
-// Events from both platforms go through one queue and are handled one at a
-// time, so a thread reply is always processed after the message it replies
-// to.
+// Events from both platforms go through one durable queue (see queue.go)
+// and are handled one at a time, oldest first, so a thread reply is
+// normally processed after the message it replies to.
 package bridge
 
 import (
@@ -18,6 +18,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sthorne/slack-webex-sync/internal/config"
 	"github.com/sthorne/slack-webex-sync/internal/format"
@@ -65,7 +67,14 @@ type Bridge struct {
 	slackBotUser string
 	webexSelf    model.Person
 
-	queue chan func(context.Context)
+	// Observer, if set, is told about processing outcomes (for metrics).
+	Observer Observer
+
+	wake chan struct{}
+	now  func() time.Time
+
+	enqueueMu    sync.Mutex
+	lastEnqueued time.Time
 }
 
 // New creates a bridge. Call Start before Run.
@@ -77,7 +86,8 @@ func New(cfg *config.Config, st store.Store, slack SlackAPI, wx WebexAPI) *Bridg
 		webex:     wx,
 		byChannel: map[string]config.Pairing{},
 		byRoom:    map[string]config.Pairing{},
-		queue:     make(chan func(context.Context), 1024),
+		wake:      make(chan struct{}, 1),
+		now:       time.Now,
 	}
 	for _, p := range cfg.Pairings {
 		b.byChannel[p.SlackChannel] = p
@@ -105,37 +115,15 @@ func (b *Bridge) Start(ctx context.Context) error {
 // WebexSelfID is the service account's person id.
 func (b *Bridge) WebexSelfID() string { return b.webexSelf.ID }
 
-// SubmitSlack queues a Slack event. Safe for concurrent use.
-func (b *Bridge) SubmitSlack(ev model.SlackEvent) {
-	b.queue <- func(ctx context.Context) { b.HandleSlack(ctx, ev) }
-}
-
-// SubmitWebex queues a Webex event. Safe for concurrent use.
-func (b *Bridge) SubmitWebex(ev model.WebexEvent) {
-	b.queue <- func(ctx context.Context) { b.HandleWebex(ctx, ev) }
-}
-
-// Run processes queued events until ctx is cancelled.
-func (b *Bridge) Run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case job := <-b.queue:
-			job(ctx)
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Slack -> Webex
 // ---------------------------------------------------------------------------
 
 // HandleSlack processes one Slack event synchronously.
-func (b *Bridge) HandleSlack(ctx context.Context, ev model.SlackEvent) {
+func (b *Bridge) HandleSlack(ctx context.Context, ev model.SlackEvent) error {
 	pairing, ok := b.byChannel[ev.Channel]
 	if !ok {
-		return
+		return nil
 	}
 	var err error
 	switch ev.Kind {
@@ -151,8 +139,9 @@ func (b *Bridge) HandleSlack(ctx context.Context, ev model.SlackEvent) {
 		err = b.slackReactionRemoved(ctx, pairing, ev)
 	}
 	if err != nil {
-		slog.Error("slack event not synced", "pairing", pairing.Name, "kind", ev.Kind, "err", err)
+		return fmt.Errorf("pairing %s: %w", pairing.Name, err)
 	}
+	return nil
 }
 
 func (b *Bridge) isOwnSlack(m model.SlackMessage) bool {
@@ -357,13 +346,13 @@ func (b *Bridge) slackReactionRemoved(ctx context.Context, p config.Pairing, ev 
 // ---------------------------------------------------------------------------
 
 // HandleWebex processes one Webex event synchronously.
-func (b *Bridge) HandleWebex(ctx context.Context, ev model.WebexEvent) {
+func (b *Bridge) HandleWebex(ctx context.Context, ev model.WebexEvent) error {
 	pairing, ok := b.byRoom[ev.RoomID]
 	if !ok {
-		return
+		return nil
 	}
 	if ev.ActorID != "" && webex.UUIDOf(ev.ActorID) == webex.UUIDOf(b.webexSelf.ID) {
-		return
+		return nil
 	}
 	var err error
 	switch ev.Kind {
@@ -377,8 +366,9 @@ func (b *Bridge) HandleWebex(ctx context.Context, ev model.WebexEvent) {
 		err = b.webexReactionAdded(ctx, pairing, ev)
 	}
 	if err != nil {
-		slog.Error("webex event not synced", "pairing", pairing.Name, "kind", ev.Kind, "err", err)
+		return fmt.Errorf("pairing %s: %w", pairing.Name, err)
 	}
+	return nil
 }
 
 func (b *Bridge) renderForSlack(ctx context.Context, msg model.WebexMessage) string {

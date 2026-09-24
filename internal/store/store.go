@@ -124,7 +124,61 @@ type Store interface {
 	// records from reads.
 	Purge(ctx context.Context, before time.Time) (int, error)
 
+	EventQueue
+
 	Close() error
+}
+
+// EventStatus is where a queued event is in its life.
+type EventStatus string
+
+const (
+	// EventPending events are waiting to be processed or retried.
+	EventPending EventStatus = "pending"
+	// EventParked events failed too many times and wait for an operator.
+	EventParked EventStatus = "parked"
+)
+
+// QueuedEvent is an incoming Slack or Webex event saved before it is
+// acknowledged, so a crash or failure never loses it.
+type QueuedEvent struct {
+	ID string
+	// Payload is opaque to the store.
+	Payload []byte
+	Status  EventStatus
+	// Enqueued orders events: they are processed oldest first.
+	Enqueued time.Time
+	// Attempts is how many times processing has failed.
+	Attempts int
+	// NextAttempt is when a pending event is next due.
+	NextAttempt time.Time
+	LastError   string
+}
+
+// EventQueue is the durable queue part of the contract. Queued events are
+// never removed by Purge.
+//
+// Times are stored with at least millisecond precision; backends may
+// truncate finer precision.
+type EventQueue interface {
+	// EnqueueEvent stores a new event. Enqueueing an ID that already exists
+	// changes nothing.
+	EnqueueEvent(ctx context.Context, e QueuedEvent) error
+	// DueEvents returns up to limit pending events whose NextAttempt is at
+	// or before now, oldest Enqueued first (ties broken by ID).
+	DueEvents(ctx context.Context, now time.Time, limit int) ([]QueuedEvent, error)
+	// UpdateEvent replaces the Status, Attempts, NextAttempt and LastError
+	// of an existing event, found by ID. Updating a missing event is not an
+	// error.
+	UpdateEvent(ctx context.Context, e QueuedEvent) error
+	// DeleteEvent removes an event; a missing event is not an error.
+	DeleteEvent(ctx context.Context, id string) error
+	// GetEvent finds an event by ID, or returns (nil, nil).
+	GetEvent(ctx context.Context, id string) (*QueuedEvent, error)
+	// ParkedEvents returns up to limit parked events, oldest Enqueued first.
+	ParkedEvents(ctx context.Context, limit int) ([]QueuedEvent, error)
+	// CountEvents returns how many events are pending and parked.
+	CountEvents(ctx context.Context) (pending, parked int, err error)
 }
 
 // Options configures a backend.

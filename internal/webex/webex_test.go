@@ -269,7 +269,10 @@ func TestPoller(t *testing.T) {
 		{ID: "old", PersonID: "P1", Created: at(-time.Hour)},
 	}
 	var got []string
-	sink := func(ev model.WebexEvent) { got = append(got, fmt.Sprintf("%d:%s", ev.Kind, ev.MessageID)) }
+	sink := func(ev model.WebexEvent) error {
+		got = append(got, fmt.Sprintf("%d:%s", ev.Kind, ev.MessageID))
+		return nil
+	}
 	p.PollOnce(context.Background(), sink)
 	want := []string{
 		fmt.Sprintf("%d:edited", model.WebexMessageUpdated),
@@ -284,5 +287,29 @@ func TestPoller(t *testing.T) {
 	p.PollOnce(context.Background(), sink)
 	if len(got) != 0 {
 		t.Errorf("second poll replayed %v", got)
+	}
+	if p.LastSuccess().IsZero() {
+		t.Error("LastSuccess not recorded")
+	}
+}
+
+func TestPollerRetriesWhenQueueingFails(t *testing.T) {
+	client, api, _ := newTestClient(t)
+	p := NewPoller(client, []string{"R1"}, "ME")
+	api.messages = []model.WebexMessage{
+		{ID: "new1", PersonID: "P1", Created: p.lastCreated["R1"].Add(time.Second).UTC().Format(time.RFC3339Nano)},
+	}
+	failing := func(model.WebexEvent) error { return fmt.Errorf("store down") }
+	p.PollOnce(context.Background(), failing)
+	if !p.LastSuccess().IsZero() {
+		t.Error("a failed poll was recorded as a success")
+	}
+	var got []string
+	p.PollOnce(context.Background(), func(ev model.WebexEvent) error {
+		got = append(got, ev.MessageID)
+		return nil
+	})
+	if fmt.Sprint(got) != "[new1]" {
+		t.Errorf("message lost after a failed queue attempt: %v", got)
 	}
 }

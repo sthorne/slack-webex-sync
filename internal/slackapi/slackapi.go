@@ -212,8 +212,14 @@ func isSlackError(err error, code string) bool {
 	return err.Error() == code
 }
 
-// Listen runs Socket Mode until ctx is cancelled, passing events to sink.
-func (c *Client) Listen(ctx context.Context, sink func(model.SlackEvent)) error {
+// Listen runs Socket Mode until ctx is cancelled. Each event is passed to
+// sink and acknowledged only if sink returns nil; otherwise Slack delivers
+// it again. onState, if not nil, is told when the connection goes up or
+// down.
+func (c *Client) Listen(ctx context.Context, sink func(model.SlackEvent) error, onState func(connected bool)) error {
+	if onState == nil {
+		onState = func(bool) {}
+	}
 	sm := socketmode.New(c.api)
 	go func() {
 		for {
@@ -229,22 +235,38 @@ func (c *Client) Listen(ctx context.Context, sink func(model.SlackEvent)) error 
 					slog.Info("slack socket mode connecting")
 				case socketmode.EventTypeConnected:
 					slog.Info("slack socket mode connected")
-				case socketmode.EventTypeConnectionError:
-					slog.Warn("slack socket mode connection error", "data", fmt.Sprint(evt.Data))
+					onState(true)
+				case socketmode.EventTypeConnectionError, socketmode.EventTypeDisconnect, socketmode.EventTypeInvalidAuth:
+					slog.Warn("slack socket mode disconnected", "type", evt.Type, "data", fmt.Sprint(evt.Data))
+					onState(false)
 				case socketmode.EventTypeEventsAPI:
-					if evt.Request != nil {
+					if deliver(evt.Data, sink) && evt.Request != nil {
 						sm.Ack(*evt.Request)
-					}
-					if api, ok := evt.Data.(slackevents.EventsAPIEvent); ok {
-						if ev, ok := Translate(api.InnerEvent.Data); ok {
-							sink(ev)
-						}
 					}
 				}
 			}
 		}
 	}()
 	return sm.RunContext(ctx)
+}
+
+// deliver hands an Events API payload to sink and reports whether it may be
+// acknowledged: events the bridge ignores always may, others only once
+// saved.
+func deliver(data any, sink func(model.SlackEvent) error) bool {
+	api, ok := data.(slackevents.EventsAPIEvent)
+	if !ok {
+		return true
+	}
+	ev, ok := Translate(api.InnerEvent.Data)
+	if !ok {
+		return true
+	}
+	if err := sink(ev); err != nil {
+		slog.Error("could not queue slack event; leaving it unacknowledged so Slack redelivers it", "err", err)
+		return false
+	}
+	return true
 }
 
 // Translate converts a slack-go inner event to a bridge event.

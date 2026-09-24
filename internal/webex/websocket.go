@@ -108,8 +108,9 @@ func (l *Listener) device(ctx context.Context) (device, error) {
 	return d, nil
 }
 
-// Run connects and reconnects until ctx is cancelled, passing events to sink.
-func (l *Listener) Run(ctx context.Context, sink func(model.WebexEvent)) {
+// Run connects and reconnects until ctx is cancelled, passing events to
+// sink. A frame is acknowledged only after sink has accepted all its events.
+func (l *Listener) Run(ctx context.Context, sink func(model.WebexEvent) error) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		started := time.Now()
@@ -130,7 +131,7 @@ func (l *Listener) Run(ctx context.Context, sink func(model.WebexEvent)) {
 	}
 }
 
-func (l *Listener) connect(ctx context.Context, sink func(model.WebexEvent)) error {
+func (l *Listener) connect(ctx context.Context, sink func(model.WebexEvent) error) error {
 	d, err := l.device(ctx)
 	if err != nil {
 		return err
@@ -202,11 +203,18 @@ func (l *Listener) connect(ctx context.Context, sink func(model.WebexEvent)) err
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		ackID, events := l.translate(raw)
-		if ackID != "" {
-			_ = conn.WriteJSON(map[string]string{"type": "ack", "messageId": ackID})
-		}
+		accepted := true
 		for _, ev := range events {
-			sink(ev)
+			if err := sink(ev); err != nil {
+				// Leave the frame unacknowledged. The catch-up poll after
+				// the next reconnect finds the message if it is not redelivered.
+				slog.Error("could not queue webex event", "err", err)
+				accepted = false
+				break
+			}
+		}
+		if ackID != "" && accepted {
+			_ = conn.WriteJSON(map[string]string{"type": "ack", "messageId": ackID})
 		}
 	}
 }

@@ -458,3 +458,193 @@ func (s *Store) Purge(_ context.Context, before time.Time) (int, error) {
 	s.mu.Unlock()
 	return 0, nil
 }
+
+// ---------------------------------------------------------------------------
+// Event queue
+//
+//	pk                    sk                        item
+//	EV␟{id}               "-"                       the event (never expires)
+//	EQ␟{status}           {enqueued:020d}␟{id}      index entry, sorted by age
+//
+// Query on EQ␟pending returns events oldest first without a secondary index.
+
+func eventPK(id string) string { return pk("EV", id) }
+
+func queuePK(status store.EventStatus) string { return pk("EQ", string(status)) }
+
+func queueSK(e store.QueuedEvent) string {
+	return fmt.Sprintf("%020d%s%s", e.Enqueued.UnixMicro(), sep, e.ID)
+}
+
+func eventItem(e store.QueuedEvent) map[string]types.AttributeValue {
+	item := key(eventPK(e.ID), noSort)
+	item["id"] = str(e.ID)
+	item["payload"] = &types.AttributeValueMemberB{Value: e.Payload}
+	item["status"] = str(string(e.Status))
+	item["enqueued"] = num(e.Enqueued.UnixMicro())
+	item["attempts"] = num(int64(e.Attempts))
+	item["next"] = num(e.NextAttempt.UnixMicro())
+	item["last_error"] = str(e.LastError)
+	return item
+}
+
+func indexItem(e store.QueuedEvent) map[string]types.AttributeValue {
+	item := key(queuePK(e.Status), queueSK(e))
+	item["id"] = str(e.ID)
+	item["next"] = num(e.NextAttempt.UnixMicro())
+	return item
+}
+
+func toEvent(item map[string]types.AttributeValue) store.QueuedEvent {
+	e := store.QueuedEvent{
+		ID:          getS(item, "id"),
+		Status:      store.EventStatus(getS(item, "status")),
+		Enqueued:    time.UnixMicro(getN(item, "enqueued")),
+		Attempts:    int(getN(item, "attempts")),
+		NextAttempt: time.UnixMicro(getN(item, "next")),
+		LastError:   getS(item, "last_error"),
+	}
+	if b, ok := item["payload"].(*types.AttributeValueMemberB); ok {
+		e.Payload = b.Value
+	}
+	return e
+}
+
+func (s *Store) EnqueueEvent(ctx context.Context, e store.QueuedEvent) error {
+	_, err := s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Put: &types.Put{TableName: &s.table, Item: eventItem(e), ConditionExpression: aws.String("attribute_not_exists(pk)")}},
+		{Put: &types.Put{TableName: &s.table, Item: indexItem(e)}},
+	}})
+	var cancelled *types.TransactionCanceledException
+	if errors.As(err, &cancelled) {
+		for _, r := range cancelled.CancellationReasons {
+			if aws.ToString(r.Code) == "ConditionalCheckFailed" {
+				return nil // already enqueued
+			}
+		}
+	}
+	return err
+}
+
+func (s *Store) GetEvent(ctx context.Context, id string) (*store.QueuedEvent, error) {
+	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &s.table, Key: key(eventPK(id), noSort), ConsistentRead: aws.Bool(true),
+	})
+	if err != nil || len(out.Item) == 0 {
+		return nil, err
+	}
+	e := toEvent(out.Item)
+	return &e, nil
+}
+
+// queued walks a status index oldest first and loads matching events.
+func (s *Store) queued(ctx context.Context, status store.EventStatus, limit int, filter string, values map[string]types.AttributeValue, names ...string) ([]store.QueuedEvent, error) {
+	if values == nil {
+		values = map[string]types.AttributeValue{}
+	}
+	values[":pk"] = str(queuePK(status))
+	input := &dynamodb.QueryInput{
+		TableName:                 &s.table,
+		KeyConditionExpression:    aws.String("pk = :pk"),
+		ExpressionAttributeValues: values,
+		ConsistentRead:            aws.Bool(true),
+	}
+	if filter != "" {
+		input.FilterExpression = aws.String(filter)
+	}
+	if len(names) > 0 {
+		input.ExpressionAttributeNames = map[string]string{}
+		for _, n := range names {
+			input.ExpressionAttributeNames[n] = strings.TrimPrefix(n, "#")
+		}
+	}
+	var out []store.QueuedEvent
+	for len(out) < limit {
+		page, err := s.db.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range page.Items {
+			if len(out) == limit {
+				break
+			}
+			e, err := s.GetEvent(ctx, getS(entry, "id"))
+			if err != nil {
+				return nil, err
+			}
+			if e != nil && e.Status == status {
+				out = append(out, *e)
+			}
+		}
+		if len(page.LastEvaluatedKey) == 0 {
+			break
+		}
+		input.ExclusiveStartKey = page.LastEvaluatedKey
+	}
+	return out, nil
+}
+
+func (s *Store) DueEvents(ctx context.Context, now time.Time, limit int) ([]store.QueuedEvent, error) {
+	return s.queued(ctx, store.EventPending, limit, "#next <= :now", map[string]types.AttributeValue{
+		":now": num(now.UnixMicro()),
+	}, "#next")
+}
+
+func (s *Store) ParkedEvents(ctx context.Context, limit int) ([]store.QueuedEvent, error) {
+	return s.queued(ctx, store.EventParked, limit, "", nil)
+}
+
+func (s *Store) UpdateEvent(ctx context.Context, e store.QueuedEvent) error {
+	old, err := s.GetEvent(ctx, e.ID)
+	if err != nil || old == nil {
+		return err
+	}
+	updated := *old
+	updated.Status, updated.Attempts, updated.NextAttempt, updated.LastError = e.Status, e.Attempts, e.NextAttempt, e.LastError
+	items := []types.TransactWriteItem{
+		{Put: &types.Put{TableName: &s.table, Item: eventItem(updated)}},
+		{Put: &types.Put{TableName: &s.table, Item: indexItem(updated)}},
+	}
+	if old.Status != updated.Status {
+		items = append(items, s.del(queuePK(old.Status), queueSK(*old)))
+	}
+	return s.transact(ctx, items...)
+}
+
+func (s *Store) DeleteEvent(ctx context.Context, id string) error {
+	old, err := s.GetEvent(ctx, id)
+	if err != nil || old == nil {
+		return err
+	}
+	return s.transact(ctx, s.del(eventPK(id), noSort), s.del(queuePK(old.Status), queueSK(*old)))
+}
+
+func (s *Store) countQueue(ctx context.Context, status store.EventStatus) (int, error) {
+	input := &dynamodb.QueryInput{
+		TableName:                 &s.table,
+		KeyConditionExpression:    aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(queuePK(status))},
+		Select:                    types.SelectCount,
+		ConsistentRead:            aws.Bool(true),
+	}
+	total := 0
+	for {
+		out, err := s.db.Query(ctx, input)
+		if err != nil {
+			return 0, err
+		}
+		total += int(out.Count)
+		if len(out.LastEvaluatedKey) == 0 {
+			return total, nil
+		}
+		input.ExclusiveStartKey = out.LastEvaluatedKey
+	}
+}
+
+func (s *Store) CountEvents(ctx context.Context) (pending, parked int, err error) {
+	if pending, err = s.countQueue(ctx, store.EventPending); err != nil {
+		return 0, 0, err
+	}
+	parked, err = s.countQueue(ctx, store.EventParked)
+	return pending, parked, err
+}

@@ -94,6 +94,16 @@ var schema = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS webex_reactions_message ON webex_reactions (webex_id, reaction)`,
 	`CREATE INDEX IF NOT EXISTS webex_reactions_created ON webex_reactions (created_at)`,
+	`CREATE TABLE IF NOT EXISTS events (
+		id           TEXT PRIMARY KEY,
+		payload      TEXT NOT NULL,
+		status       TEXT NOT NULL,
+		enqueued     BIGINT NOT NULL,
+		attempts     INTEGER NOT NULL DEFAULT 0,
+		next_attempt BIGINT NOT NULL,
+		last_error   TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE INDEX IF NOT EXISTS events_due ON events (status, enqueued, id)`,
 	`CREATE TABLE IF NOT EXISTS kv (
 		k TEXT PRIMARY KEY,
 		v TEXT NOT NULL
@@ -300,4 +310,101 @@ func (s *Store) Purge(ctx context.Context, before time.Time) (int, error) {
 		removed += int(n)
 	}
 	return removed, tx.Commit()
+}
+
+// ---------------------------------------------------------------------------
+// Event queue
+
+const eventColumns = `id, payload, status, enqueued, attempts, next_attempt, last_error`
+
+func (s *Store) EnqueueEvent(ctx context.Context, e store.QueuedEvent) error {
+	_, err := s.db.ExecContext(ctx, s.q(`
+		INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO NOTHING`),
+		e.ID, string(e.Payload), string(e.Status), e.Enqueued.UnixMicro(), e.Attempts, e.NextAttempt.UnixMicro(), e.LastError)
+	return err
+}
+
+type scanner interface{ Scan(dest ...any) error }
+
+func scanEvent(row scanner) (store.QueuedEvent, error) {
+	var e store.QueuedEvent
+	var payload, status string
+	var enqueued, next int64
+	err := row.Scan(&e.ID, &payload, &status, &enqueued, &e.Attempts, &next, &e.LastError)
+	e.Payload, e.Status = []byte(payload), store.EventStatus(status)
+	e.Enqueued, e.NextAttempt = time.UnixMicro(enqueued), time.UnixMicro(next)
+	return e, err
+}
+
+func (s *Store) listEvents(ctx context.Context, query string, args ...any) ([]store.QueuedEvent, error) {
+	rows, err := s.db.QueryContext(ctx, s.q(query), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []store.QueuedEvent
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DueEvents(ctx context.Context, now time.Time, limit int) ([]store.QueuedEvent, error) {
+	return s.listEvents(ctx, `SELECT `+eventColumns+` FROM events
+		WHERE status = ? AND next_attempt <= ? ORDER BY enqueued, id LIMIT ?`,
+		string(store.EventPending), now.UnixMicro(), limit)
+}
+
+func (s *Store) ParkedEvents(ctx context.Context, limit int) ([]store.QueuedEvent, error) {
+	return s.listEvents(ctx, `SELECT `+eventColumns+` FROM events
+		WHERE status = ? ORDER BY enqueued, id LIMIT ?`, string(store.EventParked), limit)
+}
+
+func (s *Store) UpdateEvent(ctx context.Context, e store.QueuedEvent) error {
+	_, err := s.db.ExecContext(ctx, s.q(`
+		UPDATE events SET status = ?, attempts = ?, next_attempt = ?, last_error = ? WHERE id = ?`),
+		string(e.Status), e.Attempts, e.NextAttempt.UnixMicro(), e.LastError, e.ID)
+	return err
+}
+
+func (s *Store) DeleteEvent(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, s.q(`DELETE FROM events WHERE id = ?`), id)
+	return err
+}
+
+func (s *Store) GetEvent(ctx context.Context, id string) (*store.QueuedEvent, error) {
+	e, err := scanEvent(s.db.QueryRowContext(ctx, s.q(`SELECT `+eventColumns+` FROM events WHERE id = ?`), id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+func (s *Store) CountEvents(ctx context.Context) (pending, parked int, err error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM events GROUP BY status`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return 0, 0, err
+		}
+		if store.EventStatus(status) == store.EventParked {
+			parked += n
+		} else {
+			pending += n
+		}
+	}
+	return pending, parked, rows.Err()
 }

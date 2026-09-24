@@ -8,7 +8,7 @@
 //	mongodb+srv://cluster.example.net/slack_webex_sync
 //	...&ttl_index=false   skip native TTL indexes (for servers without them)
 //
-// Collections: links, reaction_notes, webex_reactions, kv.
+// Collections: links, reaction_notes, webex_reactions, events, kv.
 //
 // Expiry uses both mechanisms. Each record collection gets a native TTL
 // index on created_at with expireAfterSeconds set to the retention; Open
@@ -50,6 +50,7 @@ type Store struct {
 	notes     *mongo.Collection
 	reactions *mongo.Collection
 	kv        *mongo.Collection
+	events    *mongo.Collection
 	now       func() time.Time
 }
 
@@ -123,6 +124,7 @@ func New(ctx context.Context, client *mongo.Client, database string, useTTL bool
 		notes:     db.Collection("reaction_notes"),
 		reactions: db.Collection("webex_reactions"),
 		kv:        db.Collection("kv"),
+		events:    db.Collection("events"),
 		now:       opts.Clock(),
 	}
 	if _, err := s.links.Indexes().CreateOne(ctx, mongo.IndexModel{
@@ -134,6 +136,11 @@ func New(ctx context.Context, client *mongo.Client, database string, useTTL bool
 		Keys: bson.D{{Key: "webex_id", Value: 1}, {Key: "reaction", Value: 1}},
 	}); err != nil {
 		return nil, fmt.Errorf("create reactions index: %w", err)
+	}
+	if _, err := s.events.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "status", Value: 1}, {Key: "enqueued", Value: 1}, {Key: "_id", Value: 1}},
+	}); err != nil {
+		return nil, fmt.Errorf("create events index: %w", err)
 	}
 	for _, c := range []*mongo.Collection{s.links, s.notes, s.reactions} {
 		if !useTTL {
@@ -362,4 +369,101 @@ func (s *Store) Purge(ctx context.Context, before time.Time) (int, error) {
 		removed += int(res.DeletedCount)
 	}
 	return removed, nil
+}
+
+// ---------------------------------------------------------------------------
+// Event queue (never expires; times are stored as unix microseconds)
+
+type eventDoc struct {
+	ID          string `bson:"_id"`
+	Payload     []byte `bson:"payload"`
+	Status      string `bson:"status"`
+	Enqueued    int64  `bson:"enqueued"`
+	Attempts    int    `bson:"attempts"`
+	NextAttempt int64  `bson:"next_attempt"`
+	LastError   string `bson:"last_error"`
+}
+
+func (d eventDoc) event() store.QueuedEvent {
+	return store.QueuedEvent{
+		ID: d.ID, Payload: d.Payload, Status: store.EventStatus(d.Status), Enqueued: time.UnixMicro(d.Enqueued),
+		Attempts: d.Attempts, NextAttempt: time.UnixMicro(d.NextAttempt), LastError: d.LastError,
+	}
+}
+
+func (s *Store) EnqueueEvent(ctx context.Context, e store.QueuedEvent) error {
+	_, err := s.events.InsertOne(ctx, eventDoc{
+		ID: e.ID, Payload: e.Payload, Status: string(e.Status), Enqueued: e.Enqueued.UnixMicro(),
+		Attempts: e.Attempts, NextAttempt: e.NextAttempt.UnixMicro(), LastError: e.LastError,
+	})
+	if mongo.IsDuplicateKeyError(err) {
+		return nil
+	}
+	return err
+}
+
+func (s *Store) findEvents(ctx context.Context, filter bson.D, limit int) ([]store.QueuedEvent, error) {
+	cursor, err := s.events.Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: "enqueued", Value: 1}, {Key: "_id", Value: 1}}).
+		SetLimit(int64(limit)))
+	if err != nil {
+		return nil, err
+	}
+	var docs []eventDoc
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	out := make([]store.QueuedEvent, len(docs))
+	for i, d := range docs {
+		out[i] = d.event()
+	}
+	return out, nil
+}
+
+func (s *Store) DueEvents(ctx context.Context, now time.Time, limit int) ([]store.QueuedEvent, error) {
+	return s.findEvents(ctx, bson.D{
+		{Key: "status", Value: string(store.EventPending)},
+		{Key: "next_attempt", Value: bson.D{{Key: "$lte", Value: now.UnixMicro()}}},
+	}, limit)
+}
+
+func (s *Store) ParkedEvents(ctx context.Context, limit int) ([]store.QueuedEvent, error) {
+	return s.findEvents(ctx, bson.D{{Key: "status", Value: string(store.EventParked)}}, limit)
+}
+
+func (s *Store) UpdateEvent(ctx context.Context, e store.QueuedEvent) error {
+	_, err := s.events.UpdateOne(ctx, bson.D{{Key: "_id", Value: e.ID}}, bson.D{{Key: "$set", Value: bson.D{
+		{Key: "status", Value: string(e.Status)},
+		{Key: "attempts", Value: e.Attempts},
+		{Key: "next_attempt", Value: e.NextAttempt.UnixMicro()},
+		{Key: "last_error", Value: e.LastError},
+	}}})
+	return err
+}
+
+func (s *Store) DeleteEvent(ctx context.Context, id string) error {
+	_, err := s.events.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}})
+	return err
+}
+
+func (s *Store) GetEvent(ctx context.Context, id string) (*store.QueuedEvent, error) {
+	var d eventDoc
+	err := s.events.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	e := d.event()
+	return &e, nil
+}
+
+func (s *Store) CountEvents(ctx context.Context) (pending, parked int, err error) {
+	p, err := s.events.CountDocuments(ctx, bson.D{{Key: "status", Value: string(store.EventPending)}})
+	if err != nil {
+		return 0, 0, err
+	}
+	k, err := s.events.CountDocuments(ctx, bson.D{{Key: "status", Value: string(store.EventParked)}})
+	return int(p), int(k), err
 }

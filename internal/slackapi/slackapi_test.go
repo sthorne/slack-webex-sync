@@ -2,6 +2,7 @@ package slackapi
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/slack-go/slack/slackevents"
@@ -61,5 +62,26 @@ func TestTranslateReactions(t *testing.T) {
 	}
 	if _, ok := Translate(&slackevents.ReactionAddedEvent{Item: slackevents.Item{Type: "file"}}); ok {
 		t.Error("file reactions should be ignored")
+	}
+}
+
+func TestDeliverAcksOnlyAfterQueueing(t *testing.T) {
+	msg := slackevents.EventsAPIEvent{InnerEvent: slackevents.EventsAPIInnerEvent{
+		Data: parse(t, `{"type":"message","channel":"C1","user":"U1","text":"hi","ts":"1.0"}`),
+	}}
+	ok := func(model.SlackEvent) error { return nil }
+	failing := func(model.SlackEvent) error { return errors.New("store down") }
+
+	if !deliver(msg, ok) {
+		t.Error("queued event should be acknowledged")
+	}
+	if deliver(msg, failing) {
+		t.Error("event that could not be queued must not be acknowledged")
+	}
+	ignored := slackevents.EventsAPIEvent{InnerEvent: slackevents.EventsAPIInnerEvent{
+		Data: parse(t, `{"type":"message","subtype":"channel_join","channel":"C1","ts":"2.0"}`),
+	}}
+	if !deliver(ignored, failing) {
+		t.Error("events the bridge ignores should always be acknowledged")
 	}
 }

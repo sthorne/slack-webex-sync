@@ -6,6 +6,7 @@ package memstore
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -37,6 +38,7 @@ type Store struct {
 	notes     map[noteKey]stamped[store.ReactionNote]
 	reactions map[string]stamped[store.WebexReaction]
 	values    map[string]string
+	events    map[string]store.QueuedEvent
 }
 
 // New creates an empty store.
@@ -48,6 +50,7 @@ func New(opts store.Options) *Store {
 		notes:     map[noteKey]stamped[store.ReactionNote]{},
 		reactions: map[string]stamped[store.WebexReaction]{},
 		values:    map[string]string{},
+		events:    map[string]store.QueuedEvent{},
 	}
 }
 
@@ -183,3 +186,89 @@ func (s *Store) Purge(_ context.Context, before time.Time) (int, error) {
 }
 
 func (s *Store) Close() error { return nil }
+
+// ---------------------------------------------------------------------------
+// Event queue
+
+func (s *Store) EnqueueEvent(_ context.Context, e store.QueuedEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.events[e.ID]; !ok {
+		e.Payload = append([]byte(nil), e.Payload...)
+		s.events[e.ID] = e
+	}
+	return nil
+}
+
+// sorted returns matching events, oldest first.
+func (s *Store) sorted(match func(store.QueuedEvent) bool, limit int) []store.QueuedEvent {
+	var out []store.QueuedEvent
+	for _, e := range s.events {
+		if match(e) {
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Enqueued.Equal(out[j].Enqueued) {
+			return out[i].Enqueued.Before(out[j].Enqueued)
+		}
+		return out[i].ID < out[j].ID
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func (s *Store) DueEvents(_ context.Context, now time.Time, limit int) ([]store.QueuedEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sorted(func(e store.QueuedEvent) bool {
+		return e.Status == store.EventPending && !e.NextAttempt.After(now)
+	}, limit), nil
+}
+
+func (s *Store) UpdateEvent(_ context.Context, e store.QueuedEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if old, ok := s.events[e.ID]; ok {
+		old.Status, old.Attempts, old.NextAttempt, old.LastError = e.Status, e.Attempts, e.NextAttempt, e.LastError
+		s.events[e.ID] = old
+	}
+	return nil
+}
+
+func (s *Store) DeleteEvent(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.events, id)
+	return nil
+}
+
+func (s *Store) GetEvent(_ context.Context, id string) (*store.QueuedEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.events[id]; ok {
+		return &e, nil
+	}
+	return nil, nil
+}
+
+func (s *Store) ParkedEvents(_ context.Context, limit int) ([]store.QueuedEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sorted(func(e store.QueuedEvent) bool { return e.Status == store.EventParked }, limit), nil
+}
+
+func (s *Store) CountEvents(_ context.Context) (pending, parked int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.events {
+		if e.Status == store.EventParked {
+			parked++
+		} else {
+			pending++
+		}
+	}
+	return pending, parked, nil
+}

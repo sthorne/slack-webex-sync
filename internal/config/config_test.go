@@ -50,6 +50,9 @@ func TestParse(t *testing.T) {
 	if !cfg.Sync.BotMessages || !cfg.Sync.Files || cfg.Sync.Reactions {
 		t.Errorf("sync settings: %+v", cfg.Sync)
 	}
+	if cfg.Health.Listen != "127.0.0.1:9090" || cfg.Storage.EncryptionKey != "" {
+		t.Errorf("health/encryption defaults: %+v %q", cfg.Health, cfg.Storage.EncryptionKey)
+	}
 	if cfg.Storage.RetentionDays != 30 || cfg.Storage.Retention() != 30*24*time.Hour || cfg.Storage.PurgeInterval != time.Hour {
 		t.Errorf("storage defaults: %+v", cfg.Storage)
 	}
@@ -115,5 +118,17 @@ func TestMemoryDriverNeedsNoDSN(t *testing.T) {
 	raw := strings.Replace(valid, "driver: sqlite\n  dsn: ${SWS_TEST_DB:-bridge.db}", "driver: memory\n  dsn: \"\"", 1)
 	if _, err := Parse([]byte(raw)); err != nil {
 		t.Errorf("memory without dsn: %v", err)
+	}
+}
+
+func TestHealthCanBeDisabled(t *testing.T) {
+	t.Setenv("SWS_TEST_BOT", "xoxb-1")
+	t.Setenv("SWS_TEST_SECRET", "s")
+	cfg, err := Parse([]byte(valid + "health:\n  listen: \"\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Health.Listen != "" {
+		t.Errorf("listen = %q", cfg.Health.Listen)
 	}
 }
